@@ -1,7 +1,6 @@
 /**
- * LiquidBackdrop Engine v0.2.0
- * Major performance upgrade: Switched from RAF loop to Observer API.
- * Improved displacement masking logic.
+ * LiquidBackdrop Engine v0.3.0
+ * Render Upgrade: SDF-based generation, Spherical interpolation, UserSpace units.
  * 
  * @author AngryMark
  * @license MIT
@@ -21,7 +20,7 @@ export default class LiquidBackdrop {
     static start() {
         if (this.running) return;
         this.running = true;
-        console.log('💧 LiquidBackdrop v0.2.0 (Observer Upgrade) Started');
+        console.log('💧 LiquidBackdrop v0.3.0 (SDF Render) Started');
 
         if ('CSS' in window && 'registerProperty' in CSS) {
             try {
@@ -121,6 +120,7 @@ export default class LiquidBackdrop {
 
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.style.cssText = "position: absolute; width: 0; height: 0; pointer-events: none;";
+        svg.classList.add('lb-svg-root');
         
         const container = document.createElement('div');
         container.classList.add('lb-container');
@@ -172,7 +172,7 @@ export default class LiquidBackdrop {
                     const id = `lb-${item.name}-${Math.random().toString(36).substr(2, 6)}`;
                     const content = fn(element, ...item.args);
                     if (content) {
-                        svgContent += `<filter id="${id}" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">${content}</filter>`;
+                        svgContent += `<filter id="${id}" x="0%" y="0%" width="100%" height="100%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB">${content}</filter>`;
                         filterParts.push(`url(#${id})`);
                     }
                 }
@@ -204,27 +204,39 @@ export default class LiquidBackdrop {
     }
 
     static #registerCore() {
-        this.filters.set('liquid-glass', (element, refraction = 1, offset = 10, chromatic = 0) => {
+        this.filters.set('liquid-glass', (element, refraction = 1, bevel = 10, chromatic = 0) => {
             const width = Math.round(element.offsetWidth);
             const height = Math.round(element.offsetHeight);
             if (width === 0 || height === 0) return '';
 
-            const refractionValue = parseFloat(refraction) / 2 || 0;
-            const offsetValue = (parseFloat(offset) || 0) / 2;
+            const refractionValue = parseFloat(refraction) || 0;
+            const bevelValue = Math.max(1, parseFloat(bevel) || 0);
             const chromaticValue = parseFloat(chromatic) || 0;
-            
-            const computed = getComputedStyle(element);
-            let borderRadius = 0;
-            if (computed.borderRadius.includes('%')) {
-                borderRadius = (parseFloat(computed.borderRadius) / 100) * Math.min(width, height);
-            } else {
-                borderRadius = parseFloat(computed.borderRadius) || 0;
-            }
 
             const maxDimension = Math.ceil(Math.max(width, height));
 
-            function createDisplacementMap(refractionMod) {
-                const adjustedRefraction = refractionValue + refractionMod;
+            function drawRoundedPath(ctx, x, y, w, h, r) {
+                const radius = Math.min(r, Math.min(w / 2, h / 2));
+                ctx.beginPath();
+                ctx.moveTo(x + radius, y);
+                ctx.lineTo(x + w - radius, y);
+                ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+                ctx.lineTo(x + w, y + h - radius);
+                ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+                ctx.lineTo(x + radius, y + h);
+                ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+                ctx.lineTo(x, y + radius);
+                ctx.quadraticCurveTo(x, y, x + radius, y);
+                ctx.closePath();
+            }
+
+            function circleMap(x) {
+                if (x >= 1) return 1;
+                if (x <= 0) return 0;
+                return 1.0 - Math.sqrt(1.0 - x * x);
+            }
+
+            function createMap() {
                 const canvas = document.createElement('canvas');
                 canvas.width = maxDimension;
                 canvas.height = maxDimension;
@@ -233,49 +245,60 @@ export default class LiquidBackdrop {
                 const imageData = ctx.createImageData(maxDimension, maxDimension);
                 const data = imageData.data;
 
-                for (let i = 0; i < data.length; i += 4) {
-                    data[i] = 127;     
-                    data[i + 1] = 127; 
-                    data[i + 2] = 127; 
-                    data[i + 3] = 255; 
-                }
+                const startX = Math.floor((maxDimension - width) / 2);
+                const startY = Math.floor((maxDimension - height) / 2);
+                const endX = startX + width;
+                const endY = startY + height;
 
-                const topOffset = Math.floor(maxDimension / 2);
-                
-                for (let y = 0; y < topOffset; y++) {
-                    for (let x = 0; x < maxDimension; x++) {
-                        const gradientSegment = (topOffset - y) / topOffset; 
-                        const idx = (y * maxDimension + x) * 4;
-                        const v = 1 * adjustedRefraction;
-                        data[idx + 2] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
-                    }
-                }
-                for (let y = maxDimension - topOffset; y < maxDimension; y++) {
-                    for (let x = 0; x < maxDimension; x++) {
-                        const gradientSegment = (y - (maxDimension - topOffset)) / topOffset; 
-                        const idx = (y * maxDimension + x) * 4;
-                        const v = -1 * adjustedRefraction;
-                        data[idx + 2] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
-                    }
-                }
-                const leftOffset = Math.floor(maxDimension / 2);
+                const limit = bevelValue;
+
                 for (let y = 0; y < maxDimension; y++) {
-                    for (let x = 0; x < leftOffset; x++) {
-                        const gradientSegment = (leftOffset - x) / leftOffset; 
+                    for (let x = 0; x < maxDimension; x++) {
                         const idx = (y * maxDimension + x) * 4;
-                        const v = 1 * adjustedRefraction;
-                        data[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
+
+                        if (x < startX || x >= endX || y < startY || y >= endY) {
+                            data[idx] = 127;     
+                            data[idx + 1] = 0;   
+                            data[idx + 2] = 127; 
+                            data[idx + 3] = 255;
+                            continue;
+                        }
+
+                        const lx = x - startX;
+                        const ly = y - startY;
+
+                        const dLeft = lx;
+                        const dRight = width - 1 - lx;
+                        const dTop = ly;
+                        const dBottom = height - 1 - ly;
+                        const minDist = Math.min(dLeft, dRight, dTop, dBottom);
+
+                        if (minDist < limit) {
+                            const progress = 1 - (minDist / limit); 
+                            const intensity = circleMap(progress);  
+
+                            let nx = 0, ny = 0;
+                            if (minDist === dLeft) nx = -1;
+                            else if (minDist === dRight) nx = 1;
+                            
+                            if (minDist === dTop) ny = -1;
+                            else if (minDist === dBottom) ny = 1;
+
+                            const dispX = 127 - (nx * intensity * 127);
+                            const dispY = 127 - (ny * intensity * 127);
+
+                            data[idx] = Math.max(0, Math.min(255, dispX));     // R
+                            data[idx + 2] = Math.max(0, Math.min(255, dispY)); // B
+                            data[idx + 1] = 0; // No highlight
+                            data[idx + 3] = 255;
+                        } else {
+                            data[idx] = 127;
+                            data[idx + 1] = 0;
+                            data[idx + 2] = 127;
+                            data[idx + 3] = 255;
+                        }
                     }
                 }
-                for (let y = 0; y < maxDimension; y++) {
-                    for (let x = maxDimension - leftOffset; x < maxDimension; x++) {
-                        const gradientSegment = (x - (maxDimension - leftOffset)) / leftOffset; 
-                        const idx = (y * maxDimension + x) * 4;
-                        const v = -1 * adjustedRefraction;
-                        data[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
-                    }
-                }
-                
                 ctx.putImageData(imageData, 0, 0);
                 return canvas;
             }
@@ -286,7 +309,7 @@ export default class LiquidBackdrop {
                 canvas.height = height;
                 const ctx = canvas.getContext('2d');
 
-                ctx.fillStyle = "rgb(127, 127, 127)";
+                ctx.fillStyle = "rgb(127, 0, 127)";
                 ctx.fillRect(0, 0, width, height);
 
                 const offsetX = (maxDimension - width) / 2;
@@ -294,58 +317,51 @@ export default class LiquidBackdrop {
                 
                 ctx.drawImage(sourceCanvas, -Math.round(offsetX), -Math.round(offsetY));
                 
-                if (borderRadius > 0) {
-                     const inset = offsetValue * 1;
-                     ctx.fillStyle = "rgb(127, 127, 127)";
-                     
-                     ctx.filter = `blur(${offsetValue}px)`;
-                     
-                     ctx.beginPath();
-                     ctx.roundRect(inset, inset, width - (inset * 2), height - (inset * 2), Math.max(0, borderRadius - inset));
+                const computed = getComputedStyle(element);
+                let br = parseFloat(computed.borderRadius) || 0;
+                if (computed.borderRadius.includes('%')) br = (parseFloat(computed.borderRadius)/100) * Math.min(width, height);
+
+                const inset = bevelValue;
+                
+                if (width > inset * 2 && height > inset * 2) {
+                     ctx.fillStyle = "rgb(127, 0, 127)";
+                     if (bevelValue > 2) ctx.filter = `blur(${bevelValue/3}px)`;
+                     drawRoundedPath(ctx, inset, inset, width - (inset * 2), height - (inset * 2), Math.max(0, br - inset/2));
                      ctx.fill();
-                } else if (offsetValue > 0) {
-                    ctx.filter = `blur(${offsetValue}px)`;
-                    ctx.drawImage(canvas, 0, 0);
                 }
 
                 return canvas.toDataURL();
             }
 
+            const mapCanvas = createMap();
+            const mainDataURL = createFinalCanvas(mapCanvas);
+
+            const baseScale = refractionValue * 2;
+
             if (chromaticValue === 0) {
-                const mapCanvas = createDisplacementMap(0);
-                const dataURL = createFinalCanvas(mapCanvas);
                 return `
-                    <feImage result="FEIMG" href="${dataURL}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="FEIMG" scale="127" yChannelSelector="B" xChannelSelector="R" color-interpolation-filters="sRGB"/>
+                    <feImage result="MAP" href="${mainDataURL}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${baseScale}" xChannelSelector="R" yChannelSelector="B"/>
                 `;
             } else {
-                const chromaticOffset = chromaticValue * 0.25;
-                const redDataURL = createFinalCanvas(createDisplacementMap(chromaticOffset));
-                const greenDataURL = createFinalCanvas(createDisplacementMap(0));
-                const blueDataURL = createFinalCanvas(createDisplacementMap(-chromaticOffset));
+                 const rScale = baseScale + (chromaticValue * 2);
+                 const bScale = Math.max(0, baseScale - (chromaticValue * 2));
+                 
+                 return `
+                    <feImage result="MAP" href="${mainDataURL}" color-interpolation-filters="sRGB"/>
+                    
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${rScale}" xChannelSelector="R" yChannelSelector="B" result="R_DISP"/>
+                    <feComponentTransfer in="R_DISP" result="R_LAYER"><feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
 
-                return `
-                    <feImage result="redImg" href="${redDataURL}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="redImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="redDisplaced"/>
-                    <feComponentTransfer in="redDisplaced" result="redChannel">
-                        <feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/>
-                    </feComponentTransfer>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${baseScale}" xChannelSelector="R" yChannelSelector="B" result="G_DISP"/>
+                    <feComponentTransfer in="G_DISP" result="G_LAYER"><feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
 
-                    <feImage result="greenImg" href="${greenDataURL}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="greenImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="greenDisplaced"/>
-                    <feComponentTransfer in="greenDisplaced" result="greenChannel">
-                        <feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/>
-                    </feComponentTransfer>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${bScale}" xChannelSelector="R" yChannelSelector="B" result="B_DISP"/>
+                    <feComponentTransfer in="B_DISP" result="B_LAYER"><feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/></feComponentTransfer>
 
-                    <feImage result="blueImg" href="${blueDataURL}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="blueImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="blueDisplaced"/>
-                    <feComponentTransfer in="blueDisplaced" result="blueChannel">
-                        <feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/>
-                    </feComponentTransfer>
-
-                    <feComposite in="redChannel" in2="greenChannel" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="redGreen"/>
-                    <feComposite in="redGreen" in2="blueChannel" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="final"/>
-                `;
+                    <feComposite in="R_LAYER" in2="G_LAYER" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="RG"/>
+                    <feComposite in="RG" in2="B_LAYER" operator="arithmetic" k1="0" k2="1" k3="1" k4="0"/>
+                 `;
             }
         });
     }

@@ -1,5 +1,7 @@
 /**
- * LiquidBackdrop Engine v0.1
+ * LiquidBackdrop Engine v0.2.0
+ * Major performance upgrade: Switched from RAF loop to Observer API.
+ * Improved displacement masking logic.
  * 
  * @author AngryMark
  * @license MIT
@@ -9,11 +11,17 @@ export default class LiquidBackdrop {
     static elements = new WeakMap();
     static filters = new Map();
     static running = false;
+    
+    static resizeObserver = null;
+    static mutationObserver = null;
+    static intersectionObserver = null;
+
     static CSS_PROP = '--liquid-backdrop';
 
     static start() {
         if (this.running) return;
-        console.log('💧 LiquidBackdrop v0.1.0 Started');
+        this.running = true;
+        console.log('💧 LiquidBackdrop v0.2.0 (Observer Upgrade) Started');
 
         if ('CSS' in window && 'registerProperty' in CSS) {
             try {
@@ -27,80 +35,159 @@ export default class LiquidBackdrop {
         }
 
         this.#registerCore();
-        this.running = true;
-        this.#tick();
+        this.#setupObservers();
+        this.#scanInitialDOM();
     }
 
-    static #tick() {
-        this.#scan();
-        requestAnimationFrame(() => this.#tick());
-    }
-
-    static #scan() {
-        document.querySelectorAll(`*:not(.lb-container):not(svg)`).forEach(el => {
-            const rawVal = getComputedStyle(el).getPropertyValue(this.CSS_PROP).trim();
-            const stored = this.elements.get(el);
-            const rect = el.getBoundingClientRect();
-
-            if (rawVal && rawVal !== 'none') {
-                const dimsChanged = stored && (stored.w !== rect.width || stored.h !== rect.height);
-                if (!stored || stored.val !== rawVal || dimsChanged) {
-                    this.#apply(el, rawVal);
+    static #setupObservers() {
+        this.resizeObserver = new ResizeObserver((entries) => {
+            requestAnimationFrame(() => {
+                for (const entry of entries) {
+                    const element = entry.target;
+                    const state = this.elements.get(element);
+                    if (state && state.isVisible) {
+                        this.#updateContainer(element, state.currentVal);
+                    }
                 }
-            } else if (stored) {
-                this.#remove(el);
-            }
+            });
+        });
+
+        this.intersectionObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                const element = entry.target;
+                const state = this.elements.get(element);
+                if (state) {
+                    state.isVisible = entry.isIntersecting;
+                    if (entry.isIntersecting) {
+                        this.#updateContainer(element, state.currentVal);
+                    }
+                }
+            });
+        }, { rootMargin: '200px' });
+
+        this.mutationObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                if (mutation.type === 'childList') {
+                    mutation.addedNodes.forEach(node => {
+                        if (node.nodeType === 1) this.#checkAndAttach(node);
+                    });
+                    mutation.removedNodes.forEach(node => {
+                         if (node.nodeType === 1) this.#cleanupElement(node);
+                    });
+                } else if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+                    this.#checkAndAttach(mutation.target);
+                }
+            });
+        });
+
+        this.mutationObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['style']
         });
     }
 
-    static #apply(el, val) {
+    static #scanInitialDOM() {
+        document.querySelectorAll('*').forEach(el => this.#checkAndAttach(el));
+    }
+
+    static #checkAndAttach(element) {
+        if (element.classList.contains('lb-container') || element.tagName === 'svg') return;
+
+        const val = getComputedStyle(element).getPropertyValue(this.CSS_PROP).trim();
+        const state = this.elements.get(element);
+
+        if (val && val !== 'none') {
+            if (!state || state.currentVal !== val) {
+                if (!state) {
+                    this.#initElement(element, val);
+                } else {
+                    this.#updateContainer(element, val);
+                }
+            }
+        } else {
+            if (state) {
+                this.#cleanupElement(element);
+            }
+        }
+    }
+
+    static #initElement(element, val) {
+        const computedStyle = getComputedStyle(element);
+        if (computedStyle.position === 'static') {
+            element.style.position = 'relative';
+        }
+
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.style.cssText = "position: absolute; width: 0; height: 0; pointer-events: none;";
+        
+        const container = document.createElement('div');
+        container.classList.add('lb-container');
+        container.style.cssText = "position: absolute; inset: 0; background: transparent; pointer-events: none; z-index: -1; overflow: hidden; border-radius: inherit;";
+
+        element.appendChild(svg);
+        element.appendChild(container);
+
+        this.elements.set(element, {
+            currentVal: val,
+            svg: svg,
+            container: container,
+            isVisible: true
+        });
+
+        this.resizeObserver.observe(element);
+        this.intersectionObserver.observe(element);
+
+        this.#updateContainer(element, val);
+    }
+
+    static #cleanupElement(element) {
+        if (!this.elements.has(element)) return;
+        const state = this.elements.get(element);
+        
+        this.resizeObserver.unobserve(element);
+        this.intersectionObserver.unobserve(element);
+
+        if (state.container) state.container.remove();
+        if (state.svg) state.svg.remove();
+
+        this.elements.delete(element);
+    }
+
+    static #updateContainer(element, val) {
+        const state = this.elements.get(element);
+        if (!state) return;
+
+        state.currentVal = val;
         const parsed = this.#parse(val);
+        
         let svgContent = '';
-        const filterStack = [];
+        const filterParts = [];
 
         parsed.forEach(item => {
             if (item.type === 'custom') {
                 const fn = this.filters.get(item.name);
                 if (fn) {
-                    const id = `lb-${item.name}-${Math.random().toString(36).substr(2,6)}`;
-                    const filterDef = fn(el, ...item.args);
-                    if (filterDef) {
-                        svgContent += `<filter id="${id}" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">${filterDef}</filter>`;
-                        filterStack.push(`url(#${id})`);
+                    const id = `lb-${item.name}-${Math.random().toString(36).substr(2, 6)}`;
+                    const content = fn(element, ...item.args);
+                    if (content) {
+                        svgContent += `<filter id="${id}" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">${content}</filter>`;
+                        filterParts.push(`url(#${id})`);
                     }
                 }
             } else {
-                filterStack.push(item.raw);
+                filterParts.push(item.raw);
             }
         });
 
-        this.#removeDOM(el);
-        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
-
-        const finalFilter = filterStack.join(' ');
-        const html = `
-            <svg style="position:absolute; width:0; height:0; pointer-events:none;">${svgContent}</svg>
-            <div class="lb-container" style="
-                position:absolute; inset:0; z-index:-1;
-                background:transparent; pointer-events:none; overflow:hidden; border-radius:inherit;
-                backdrop-filter: ${finalFilter}; -webkit-backdrop-filter: ${finalFilter};
-            "></div>
-        `;
+        state.svg.innerHTML = svgContent;
+        const backdropFilter = filterParts.join(' ');
         
-        el.insertAdjacentHTML('beforeend', html);
-        this.elements.set(el, { val: val, w: el.offsetWidth, h: el.offsetHeight });
-    }
-
-    static #remove(el) {
-        this.#removeDOM(el);
-        this.elements.delete(el);
-    }
-
-    static #removeDOM(el) {
-        const c = el.querySelector('.lb-container');
-        const s = el.querySelector('svg');
-        if (c) c.remove();
-        if (s && s.parentNode === el) s.remove();
+        if (backdropFilter.trim()) {
+            state.container.style.backdropFilter = backdropFilter;
+            state.container.style.webkitBackdropFilter = backdropFilter;
+        }
     }
 
     static #parse(str) {
@@ -118,125 +205,146 @@ export default class LiquidBackdrop {
 
     static #registerCore() {
         this.filters.set('liquid-glass', (element, refraction = 1, offset = 10, chromatic = 0) => {
-            const w = Math.round(element.offsetWidth);
-            const h = Math.round(element.offsetHeight);
-            const refVal = parseFloat(refraction) / 2 || 0;
-            const offVal = (parseFloat(offset) || 0) / 2;
-            const chrVal = parseFloat(chromatic) || 0;
+            const width = Math.round(element.offsetWidth);
+            const height = Math.round(element.offsetHeight);
+            if (width === 0 || height === 0) return '';
 
-            let br = 0;
-            const style = getComputedStyle(element);
-            if (style.borderRadius.includes('%')) {
-                br = (parseFloat(style.borderRadius) / 100) * Math.min(w, h);
+            const refractionValue = parseFloat(refraction) / 2 || 0;
+            const offsetValue = (parseFloat(offset) || 0) / 2;
+            const chromaticValue = parseFloat(chromatic) || 0;
+            
+            const computed = getComputedStyle(element);
+            let borderRadius = 0;
+            if (computed.borderRadius.includes('%')) {
+                borderRadius = (parseFloat(computed.borderRadius) / 100) * Math.min(width, height);
             } else {
-                br = parseFloat(style.borderRadius) || 0;
+                borderRadius = parseFloat(computed.borderRadius) || 0;
             }
 
-            const maxDim = Math.ceil(Math.max(w, h));
+            const maxDimension = Math.ceil(Math.max(width, height));
 
-            const createMap = (mod) => {
-                const adjRef = refVal + mod;
-                const img = new ImageData(maxDim, maxDim);
-                const d = img.data;
-
-                for (let i=0; i<d.length; i+=4) { d[i]=127; d[i+1]=127; d[i+2]=127; d[i+3]=255; }
-
-                const edge = Math.floor(maxDim / 2);
-
-                for (let y=0; y<edge; y++) {
-                    for (let x=0; x<maxDim; x++) {
-                        const grad = (edge - y) / edge;
-                        const idx = (y * maxDim + x) * 4;
-                        d[idx+2] = Math.max(0, Math.min(255, Math.round(127 + 127 * (1 * adjRef) * grad)));
-                    }
-                }
-                for (let y=maxDim-edge; y<maxDim; y++) {
-                    for (let x=0; x<maxDim; x++) {
-                        const grad = (y - (maxDim - edge)) / edge;
-                        const idx = (y * maxDim + x) * 4;
-                        d[idx+2] = Math.max(0, Math.min(255, Math.round(127 + 127 * (-1 * adjRef) * grad)));
-                    }
-                }
-                for (let y=0; y<maxDim; y++) {
-                    for (let x=0; x<edge; x++) {
-                        const grad = (edge - x) / edge;
-                        const idx = (y * maxDim + x) * 4;
-                        d[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * (1 * adjRef) * grad)));
-                    }
-                }
-                for (let y=0; y<maxDim; y++) {
-                    for (let x=maxDim-edge; x<maxDim; x++) {
-                        const grad = (x - (maxDim - edge)) / edge;
-                        const idx = (y * maxDim + x) * 4;
-                        d[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * (-1 * adjRef) * grad)));
-                    }
-                }
-                return img;
-            };
-
-            const imgToUrl = (imgData) => {
-                const cvs = document.createElement('canvas');
-                cvs.width = w; cvs.height = h;
-                const ctx = cvs.getContext('2d');
+            function createDisplacementMap(refractionMod) {
+                const adjustedRefraction = refractionValue + refractionMod;
+                const canvas = document.createElement('canvas');
+                canvas.width = maxDimension;
+                canvas.height = maxDimension;
+                const ctx = canvas.getContext('2d');
                 
-                const tCvs = document.createElement('canvas');
-                tCvs.width = maxDim; tCvs.height = maxDim;
-                tCvs.getContext('2d').putImageData(imgData, 0, 0);
+                const imageData = ctx.createImageData(maxDimension, maxDimension);
+                const data = imageData.data;
 
-                const ox = (maxDim - w) / 2;
-                const oy = (maxDim - h) / 2;
-                ctx.drawImage(tCvs, -ox, -oy);
+                for (let i = 0; i < data.length; i += 4) {
+                    data[i] = 127;     
+                    data[i + 1] = 127; 
+                    data[i + 2] = 127; 
+                    data[i + 3] = 255; 
+                }
 
-                if (br > 0) {
-                    const mCvs = document.createElement('canvas');
-                    mCvs.width = w; mCvs.height = h;
-                    const mCtx = mCvs.getContext('2d');
-                    mCtx.fillStyle = "rgb(127, 127, 127)"; 
-                    mCtx.beginPath();
-                    const inset = offVal * 1; 
-                    mCtx.roundRect(inset, inset, w - inset*2, h - inset*2, Math.max(0, br - inset));
-                    mCtx.fill();
-
-                    if (offVal > 0) ctx.filter = `blur(${offVal}px)`;
-                    ctx.drawImage(mCvs, 0, 0);
-                } else if (offVal > 0) {
-                    const temp = ctx.getImageData(0,0,w,h);
-                    ctx.clearRect(0,0,w,h);
-                    ctx.filter = `blur(${offVal}px)`;
-                    const tempCvs = document.createElement('canvas');
-                    tempCvs.width = w; tempCvs.height = h;
-                    tempCvs.getContext('2d').putImageData(temp, 0, 0);
-                    ctx.drawImage(tempCvs, 0, 0);
+                const topOffset = Math.floor(maxDimension / 2);
+                
+                for (let y = 0; y < topOffset; y++) {
+                    for (let x = 0; x < maxDimension; x++) {
+                        const gradientSegment = (topOffset - y) / topOffset; 
+                        const idx = (y * maxDimension + x) * 4;
+                        const v = 1 * adjustedRefraction;
+                        data[idx + 2] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
+                    }
+                }
+                for (let y = maxDimension - topOffset; y < maxDimension; y++) {
+                    for (let x = 0; x < maxDimension; x++) {
+                        const gradientSegment = (y - (maxDimension - topOffset)) / topOffset; 
+                        const idx = (y * maxDimension + x) * 4;
+                        const v = -1 * adjustedRefraction;
+                        data[idx + 2] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
+                    }
+                }
+                const leftOffset = Math.floor(maxDimension / 2);
+                for (let y = 0; y < maxDimension; y++) {
+                    for (let x = 0; x < leftOffset; x++) {
+                        const gradientSegment = (leftOffset - x) / leftOffset; 
+                        const idx = (y * maxDimension + x) * 4;
+                        const v = 1 * adjustedRefraction;
+                        data[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
+                    }
+                }
+                for (let y = 0; y < maxDimension; y++) {
+                    for (let x = maxDimension - leftOffset; x < maxDimension; x++) {
+                        const gradientSegment = (x - (maxDimension - leftOffset)) / leftOffset; 
+                        const idx = (y * maxDimension + x) * 4;
+                        const v = -1 * adjustedRefraction;
+                        data[idx] = Math.max(0, Math.min(255, Math.round(127 + 127 * v * Math.pow(gradientSegment, 1))));
+                    }
                 }
                 
-                return cvs.toDataURL();
-            };
+                ctx.putImageData(imageData, 0, 0);
+                return canvas;
+            }
 
-            if (chrVal === 0) {
-                const url = imgToUrl(createMap(0));
-                return `<feImage result="MAP" href="${url}" color-interpolation-filters="sRGB"/>
-                        <feDisplacementMap in="SourceGraphic" in2="MAP" scale="127" xChannelSelector="R" yChannelSelector="B"/>`;
+            function createFinalCanvas(sourceCanvas) {
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = "rgb(127, 127, 127)";
+                ctx.fillRect(0, 0, width, height);
+
+                const offsetX = (maxDimension - width) / 2;
+                const offsetY = (maxDimension - height) / 2;
+                
+                ctx.drawImage(sourceCanvas, -Math.round(offsetX), -Math.round(offsetY));
+                
+                if (borderRadius > 0) {
+                     const inset = offsetValue * 1;
+                     ctx.fillStyle = "rgb(127, 127, 127)";
+                     
+                     ctx.filter = `blur(${offsetValue}px)`;
+                     
+                     ctx.beginPath();
+                     ctx.roundRect(inset, inset, width - (inset * 2), height - (inset * 2), Math.max(0, borderRadius - inset));
+                     ctx.fill();
+                } else if (offsetValue > 0) {
+                    ctx.filter = `blur(${offsetValue}px)`;
+                    ctx.drawImage(canvas, 0, 0);
+                }
+
+                return canvas.toDataURL();
+            }
+
+            if (chromaticValue === 0) {
+                const mapCanvas = createDisplacementMap(0);
+                const dataURL = createFinalCanvas(mapCanvas);
+                return `
+                    <feImage result="FEIMG" href="${dataURL}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="FEIMG" scale="127" yChannelSelector="B" xChannelSelector="R" color-interpolation-filters="sRGB"/>
+                `;
             } else {
-                const offsetC = chrVal * 0.25;
-                const urlR = imgToUrl(createMap(offsetC));
-                const urlG = imgToUrl(createMap(0));
-                const urlB = imgToUrl(createMap(-offsetC));
+                const chromaticOffset = chromaticValue * 0.25;
+                const redDataURL = createFinalCanvas(createDisplacementMap(chromaticOffset));
+                const greenDataURL = createFinalCanvas(createDisplacementMap(0));
+                const blueDataURL = createFinalCanvas(createDisplacementMap(-chromaticOffset));
 
                 return `
-                    <feImage result="IR" href="${urlR}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="IR" scale="127" xChannelSelector="R" yChannelSelector="B" result="DR"/>
-                    <feComponentTransfer in="DR" result="CR"><feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feImage result="redImg" href="${redDataURL}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="redImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="redDisplaced"/>
+                    <feComponentTransfer in="redDisplaced" result="redChannel">
+                        <feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/>
+                    </feComponentTransfer>
 
-                    <feImage result="IG" href="${urlG}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="IG" scale="127" xChannelSelector="R" yChannelSelector="B" result="DG"/>
-                    <feComponentTransfer in="DG" result="CG"><feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feImage result="greenImg" href="${greenDataURL}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="greenImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="greenDisplaced"/>
+                    <feComponentTransfer in="greenDisplaced" result="greenChannel">
+                        <feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/>
+                    </feComponentTransfer>
 
-                    <feImage result="IB" href="${urlB}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="IB" scale="127" xChannelSelector="R" yChannelSelector="B" result="DB"/>
-                    <feComponentTransfer in="DB" result="CB"><feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feImage result="blueImg" href="${blueDataURL}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="blueImg" scale="127" yChannelSelector="B" xChannelSelector="R" result="blueDisplaced"/>
+                    <feComponentTransfer in="blueDisplaced" result="blueChannel">
+                        <feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/>
+                    </feComponentTransfer>
 
-                    <feComposite in="CR" in2="CG" operator="arithmetic" k2="1" k3="1" result="RG"/>
-                    <feComposite in="RG" in2="CB" operator="arithmetic" k2="1" k3="1"/>
+                    <feComposite in="redChannel" in2="greenChannel" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="redGreen"/>
+                    <feComposite in="redGreen" in2="blueChannel" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="final"/>
                 `;
             }
         });

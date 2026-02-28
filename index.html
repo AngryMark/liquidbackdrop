@@ -25,62 +25,79 @@
             border-radius: 40px; 
             z-index: 1000; 
             cursor: grab;
-            display: flex; justify-content: center; align-items: center;
-            font-size: 1.2rem; font-weight: 700;
+            display: flex; 
+            justify-content: 
+            center; align-items: center;
+            font-size: 1.2rem; 
+            font-weight: 700;
             text-shadow: 0 2px 10px rgba(0,0,0,0.5);
             box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-            border: 1px solid rgba(255,255,255,0.15);
-            --liquid-backdrop: blur(5px) liquid-glass(4, 8, 2);
+            --liquid-backdrop: blur(5px) liquid-glass(50, 50, 5) shine(0.2, 50, 0);
+            
             user-select: none; touch-action: none;
             transition: transform 0.1s;
         }
         .draggable-box:active { cursor: grabbing; transform: scale(0.98); }
 
         .controls {
-            position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+            position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
             width: 90%; max-width: 400px;
             background: rgba(0,0,0,0.6); 
             backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
-            padding: 25px; border-radius: 30px;
+            padding: 20px 25px; border-radius: 30px;
             box-sizing: border-box;
             border: 1px solid rgba(255,255,255,0.1);
             z-index: 2000;
         }
         
-        h1 { margin: 0 0 20px 0; font-size: 1.1rem; text-align: center; opacity: 0.8; }
+        h1 { margin: 0 0 15px 0; font-size: 1.1rem; text-align: center; opacity: 0.8; }
         
-        .row { margin-bottom: 15px; display: flex; gap: 15px; align-items: center; }
-        .row label { width: 80px; opacity: 0.8; font-size: 0.9rem; }
-        .row input { flex: 1; accent-color: #fff; cursor: pointer; }
+        .row { margin-bottom: 12px; display: flex; gap: 15px; align-items: center; }
+        .row label { width: 90px; opacity: 0.8; font-size: 0.85rem; }
+        .row input[type=range] { flex: 1; accent-color: #fff; cursor: pointer; }
         .row span { width: 30px; text-align: right; font-family: monospace; font-size: 0.8rem; opacity: 0.6; }
+        
+        .chk-row { margin-top: 15px; display: flex; justify-content: center; }
+        .chk-row label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.9rem; opacity: 0.9; }
     </style>
 </head>
 <body>
     <div class="background-layer"></div>
+
     <div class="draggable-box" id="target">
         Drag Me
     </div>
+
     <div class="controls">
         <h1>LiquidBackdrop Playground</h1>
+        
         <div class="row">
             <label>Blur</label>
-            <input type="range" id="blur" min="0" max="30" value="5">
-            <span id="val-blur">5</span>
+            <input type="range" id="blur" min="0" max="30" value="5"><span id="val-blur">5</span>
         </div>
         <div class="row">
             <label>Refraction</label>
-            <input type="range" id="ref" min="0" max="50" value="4">
-            <span id="val-ref">4</span>
+            <input type="range" id="ref" min="0" max="50" value="50"><span id="val-ref">50</span>
         </div>
         <div class="row">
             <label>Bevel</label>
-            <input type="range" id="bev" min="0" max="50" value="8">
-            <span id="val-bev">8</span>
+            <input type="range" id="bev" min="0" max="50" value="50"><span id="val-bev">50</span>
         </div>
         <div class="row">
             <label>Chroma</label>
-            <input type="range" id="chr" min="0" max="10" step="0.5" value="2">
-            <span id="val-chr">2</span>
+            <input type="range" id="chr" min="0" max="10" step="5" value="1"><span id="val-chr">5</span>
+        </div>
+        <div class="row">
+            <label>Shine Op</label>
+            <input type="range" id="sop" min="0" max="1" step="0.05" value="0.2"><span id="val-sop">0.2</span>
+        </div>
+        <div class="row">
+            <label>Shine Ang</label>
+            <input type="range" id="sang" min="0" max="360" value="50"><span id="val-sang">50</span>
+        </div>
+        
+        <div class="chk-row">
+            <label><input type="checkbox" id="motion"> Enable Gyroscope</label>
         </div>
     </div>
 
@@ -94,66 +111,61 @@
             blur: document.getElementById('blur'),
             ref: document.getElementById('ref'),
             bev: document.getElementById('bev'),
-            chr: document.getElementById('chr')
+            chr: document.getElementById('chr'),
+            sop: document.getElementById('sop'),
+            sang: document.getElementById('sang')
         };
         const values = {
             blur: document.getElementById('val-blur'),
             ref: document.getElementById('val-ref'),
             bev: document.getElementById('val-bev'),
-            chr: document.getElementById('val-chr')
+            chr: document.getElementById('val-chr'),
+            sop: document.getElementById('val-sop'),
+            sang: document.getElementById('val-sang')
         };
+        const chkMotion = document.getElementById('motion');
 
         function update() {
             Object.keys(inputs).forEach(k => values[k].textContent = inputs[k].value);
-            const val = `blur(${inputs.blur.value}px) liquid-glass(${inputs.ref.value}, ${inputs.bev.value}, ${inputs.chr.value}) saturate(1.2)`;
+            const motion = chkMotion.checked ? 1 : 0;
+            const val = `blur(${inputs.blur.value}px) liquid-glass(${inputs.ref.value}, ${inputs.bev.value}, ${inputs.chr.value}) shine(${inputs.sop.value}, ${inputs.sang.value}, ${motion})`;
+            
             box.style.setProperty('--liquid-backdrop', val);
         }
+
         Object.values(inputs).forEach(el => el.addEventListener('input', update));
+        chkMotion.addEventListener('change', update);
 
         let isDragging = false;
         let startPos = { x: 0, y: 0 };
-        let boxPos = { x: 0, y: 0 };
-
         function onDown(e) {
+            if(e.target !== box) return;
             isDragging = true;
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-            
-            const style = window.getComputedStyle(box);
-            const matrix = new WebKitCSSMatrix(style.transform);
-            
-            startPos.x = clientX - box.offsetLeft;
-            startPos.y = clientY - box.offsetTop;
-            
+            const cx = e.touches ? e.touches[0].clientX : e.clientX;
+            const cy = e.touches ? e.touches[0].clientY : e.clientY;
+            startPos.x = cx - box.offsetLeft;
+            startPos.y = cy - box.offsetTop;
             box.style.cursor = 'grabbing';
         }
-
         function onMove(e) {
             if (!isDragging) return;
             e.preventDefault();
-            
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-            const newX = clientX - startPos.x;
-            const newY = clientY - startPos.y;
-
-            box.style.left = `${newX}px`;
-            box.style.top = `${newY}px`;
+            const cx = e.touches ? e.touches[0].clientX : e.clientX;
+            const cy = e.touches ? e.touches[0].clientY : e.clientY;
+            box.style.left = `${cx - startPos.x}px`;
+            box.style.top = `${cy - startPos.y}px`;
         }
-
         function onUp() {
             isDragging = false;
             box.style.cursor = 'grab';
         }
-
-        box.addEventListener('mousedown', onDown);
+        window.addEventListener('mousedown', onDown);
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
-
-        box.addEventListener('touchstart', onDown, {passive: false});
+        window.addEventListener('touchstart', onDown, {passive: false});
         window.addEventListener('touchmove', onMove, {passive: false});
         window.addEventListener('touchend', onUp);
+
     </script>
 </body>
 </html>

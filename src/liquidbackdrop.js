@@ -1,6 +1,6 @@
 /**
- * LiquidBackdrop Engine v0.3.0
- * Render Upgrade: SDF-based generation, Spherical interpolation, UserSpace units.
+ * LiquidBackdrop Engine v0.4.0
+ * Feature Update: Added Gyroscopic Shine with CSS Masking & Render Fixes.
  * 
  * @author AngryMark
  * @license MIT
@@ -16,20 +16,23 @@ export default class LiquidBackdrop {
     static intersectionObserver = null;
 
     static CSS_PROP = '--liquid-backdrop';
+    static ANGLE_PROP = '--lb-angle';
+
+    static motionActive = false;
+    static targetBeta = 0;
+    static targetGamma = 0;
+    static currentBeta = 0;
+    static currentGamma = 0;
 
     static start() {
         if (this.running) return;
         this.running = true;
-        console.log('💧 LiquidBackdrop v0.3.0 (SDF Render) Started');
+        console.log('💧 LiquidBackdrop v0.4.0 Started');
 
         if ('CSS' in window && 'registerProperty' in CSS) {
             try {
-                CSS.registerProperty({
-                    name: this.CSS_PROP,
-                    syntax: '*',
-                    inherits: false,
-                    initialValue: ''
-                });
+                CSS.registerProperty({ name: this.CSS_PROP, syntax: '*', inherits: false, initialValue: '' });
+                CSS.registerProperty({ name: this.ANGLE_PROP, syntax: '<angle>', inherits: true, initialValue: '40deg' });
             } catch (e) {}
         }
 
@@ -38,155 +41,192 @@ export default class LiquidBackdrop {
         this.#scanInitialDOM();
     }
 
+    static #enableMotion() {
+        if (this.motionActive) return;
+        
+        const handler = (e) => {
+            if (e.beta === null) return;
+            this.targetBeta = e.beta;
+            this.targetGamma = e.gamma;
+        };
+
+        const loop = () => {
+            const k = 0.08;
+            this.currentBeta += (this.targetBeta - this.currentBeta) * k;
+            this.currentGamma += (this.targetGamma - this.currentGamma) * k;
+
+            const mag = Math.sqrt(this.currentBeta**2 + this.currentGamma**2);
+            if (mag > 2.0) {
+                const rad = Math.atan2(this.currentGamma, this.currentBeta);
+                const deg = -(rad * (180 / Math.PI)) + 180;
+                document.documentElement.style.setProperty(this.ANGLE_PROP, `${deg}deg`);
+            }
+            requestAnimationFrame(loop);
+        };
+
+        if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+            const req = () => {
+                DeviceOrientationEvent.requestPermission()
+                    .then(r => {
+                        if (r === 'granted') {
+                            window.addEventListener('deviceorientation', handler);
+                            this.motionActive = true;
+                            loop();
+                        }
+                    }).catch(console.error);
+                document.body.removeEventListener('click', req);
+            };
+            document.body.addEventListener('click', req, { capture: true, once: true });
+        } else {
+            window.addEventListener('deviceorientation', handler);
+            this.motionActive = true;
+            loop();
+        }
+    }
+
     static #setupObservers() {
-        this.resizeObserver = new ResizeObserver((entries) => {
+        this.resizeObserver = new ResizeObserver(entries => {
             requestAnimationFrame(() => {
                 for (const entry of entries) {
-                    const element = entry.target;
-                    const state = this.elements.get(element);
-                    if (state && state.isVisible) {
-                        this.#updateContainer(element, state.currentVal);
-                    }
+                    const el = entry.target;
+                    const st = this.elements.get(el);
+                    if (st && st.isVisible) this.#updateContainer(el, st.currentVal);
                 }
             });
         });
 
-        this.intersectionObserver = new IntersectionObserver((entries) => {
+        this.intersectionObserver = new IntersectionObserver(entries => {
             entries.forEach(entry => {
-                const element = entry.target;
-                const state = this.elements.get(element);
-                if (state) {
-                    state.isVisible = entry.isIntersecting;
-                    if (entry.isIntersecting) {
-                        this.#updateContainer(element, state.currentVal);
-                    }
+                const el = entry.target;
+                const st = this.elements.get(el);
+                if (st) {
+                    st.isVisible = entry.isIntersecting;
+                    if (st.isVisible) this.#updateContainer(el, st.currentVal);
                 }
             });
         }, { rootMargin: '200px' });
 
-        this.mutationObserver = new MutationObserver((mutations) => {
-            mutations.forEach((mutation) => {
-                if (mutation.type === 'childList') {
-                    mutation.addedNodes.forEach(node => {
-                        if (node.nodeType === 1) this.#checkAndAttach(node);
-                    });
-                    mutation.removedNodes.forEach(node => {
-                         if (node.nodeType === 1) this.#cleanupElement(node);
-                    });
-                } else if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
-                    this.#checkAndAttach(mutation.target);
+        this.mutationObserver = new MutationObserver(list => {
+            list.forEach(m => {
+                if (m.type === 'childList') {
+                    m.addedNodes.forEach(n => n.nodeType === 1 && this.#checkAndAttach(n));
+                    m.removedNodes.forEach(n => n.nodeType === 1 && this.#cleanupElement(n));
+                } else if (m.type === 'attributes' && m.attributeName === 'style') {
+                    this.#checkAndAttach(m.target);
                 }
             });
         });
-
-        this.mutationObserver.observe(document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['style']
-        });
+        this.mutationObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
     }
 
     static #scanInitialDOM() {
         document.querySelectorAll('*').forEach(el => this.#checkAndAttach(el));
     }
 
-    static #checkAndAttach(element) {
-        if (element.classList.contains('lb-container') || element.tagName === 'svg') return;
-
-        const val = getComputedStyle(element).getPropertyValue(this.CSS_PROP).trim();
-        const state = this.elements.get(element);
+    static #checkAndAttach(el) {
+        if (el.classList.contains('lb-container') || el.tagName === 'svg') return;
+        const val = getComputedStyle(el).getPropertyValue(this.CSS_PROP).trim();
+        const st = this.elements.get(el);
 
         if (val && val !== 'none') {
-            if (!state || state.currentVal !== val) {
-                if (!state) {
-                    this.#initElement(element, val);
-                } else {
-                    this.#updateContainer(element, val);
-                }
+            if (!st || st.currentVal !== val) {
+                if (!st) this.#initElement(el, val);
+                else this.#updateContainer(el, val);
             }
-        } else {
-            if (state) {
-                this.#cleanupElement(element);
-            }
-        }
+        } else if (st) this.#cleanupElement(el);
     }
 
-    static #initElement(element, val) {
-        const computedStyle = getComputedStyle(element);
-        if (computedStyle.position === 'static') {
-            element.style.position = 'relative';
-        }
+    static #initElement(el, val) {
+        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
 
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.style.cssText = "position: absolute; width: 0; height: 0; pointer-events: none;";
-        svg.classList.add('lb-svg-root');
         
         const container = document.createElement('div');
-        container.classList.add('lb-container');
+        container.className = 'lb-container';
         container.style.cssText = "position: absolute; inset: 0; background: transparent; pointer-events: none; z-index: -1; overflow: hidden; border-radius: inherit;";
 
-        element.appendChild(svg);
-        element.appendChild(container);
+        const shine = document.createElement('div');
+        shine.className = 'lb-shine';
+        shine.style.cssText = "position: absolute; inset: 0; pointer-events: none; z-index: 2; border-radius: inherit; overflow: hidden;";
 
-        this.elements.set(element, {
-            currentVal: val,
-            svg: svg,
-            container: container,
-            isVisible: true
-        });
+        el.appendChild(svg);
+        el.appendChild(container);
+        el.appendChild(shine);
 
-        this.resizeObserver.observe(element);
-        this.intersectionObserver.observe(element);
+        this.elements.set(el, { currentVal: val, svg, container, shine, isVisible: true });
 
-        this.#updateContainer(element, val);
+        this.resizeObserver.observe(el);
+        this.intersectionObserver.observe(el);
+        this.#updateContainer(el, val);
     }
 
-    static #cleanupElement(element) {
-        if (!this.elements.has(element)) return;
-        const state = this.elements.get(element);
-        
-        this.resizeObserver.unobserve(element);
-        this.intersectionObserver.unobserve(element);
-
-        if (state.container) state.container.remove();
-        if (state.svg) state.svg.remove();
-
-        this.elements.delete(element);
+    static #cleanupElement(el) {
+        if (!this.elements.has(el)) return;
+        const st = this.elements.get(el);
+        this.resizeObserver.unobserve(el);
+        this.intersectionObserver.unobserve(el);
+        st.container.remove(); st.svg.remove(); st.shine.remove();
+        this.elements.delete(el);
     }
 
-    static #updateContainer(element, val) {
-        const state = this.elements.get(element);
-        if (!state) return;
+    static #updateContainer(el, val) {
+        const st = this.elements.get(el);
+        if (!st) return;
 
-        state.currentVal = val;
+        st.currentVal = val;
         const parsed = this.#parse(val);
         
-        let svgContent = '';
-        const filterParts = [];
+        let svgHTML = '';
+        const filters = [];
+        
+        st.shine.style.background = 'none';
+        st.shine.style.boxShadow = 'none';
+        st.shine.style.webkitMask = 'none';
 
         parsed.forEach(item => {
+            if (item.name === 'shine') {
+                const [intensity = 0.1, angle = 40, motion = 0, edgeOp = 0.1] = item.args;
+                
+                if (motion === 1) this.#enableMotion();
+
+                if (edgeOp > 0) st.shine.style.boxShadow = `inset 0 0 0 1px rgba(255, 255, 255, ${edgeOp})`;
+
+                st.shine.style.webkitMask = `linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)`;
+                st.shine.style.webkitMaskComposite = 'xor';
+                st.shine.style.maskComposite = 'exclude';
+                st.shine.style.padding = '1px';
+
+                const angStr = (motion === 1) ? `var(${this.ANGLE_PROP})` : `${angle}deg`;
+                
+                const g1 = `linear-gradient(${angStr}, transparent 40%, rgba(255,255,255,${intensity}) 50%, transparent 60%)`;
+                const g2 = `linear-gradient(calc(${angStr} + 180deg), transparent 30%, rgba(255,255,255,${intensity * 0.4}) 50%, transparent 70%)`;
+                
+                st.shine.style.background = `${g1}, ${g2}`;
+                st.shine.style.backgroundBlendMode = 'screen';
+                return;
+            }
+
             if (item.type === 'custom') {
                 const fn = this.filters.get(item.name);
                 if (fn) {
                     const id = `lb-${item.name}-${Math.random().toString(36).substr(2, 6)}`;
-                    const content = fn(element, ...item.args);
+                    const content = fn(el, ...item.args);
                     if (content) {
-                        svgContent += `<filter id="${id}" x="0%" y="0%" width="100%" height="100%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB">${content}</filter>`;
-                        filterParts.push(`url(#${id})`);
+                        svgHTML += `<filter id="${id}" x="0%" y="0%" width="100%" height="100%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB">${content}</filter>`;
+                        filters.push(`url(#${id})`);
                     }
                 }
             } else {
-                filterParts.push(item.raw);
+                filters.push(item.raw);
             }
         });
 
-        state.svg.innerHTML = svgContent;
-        const backdropFilter = filterParts.join(' ');
-        
-        if (backdropFilter.trim()) {
-            state.container.style.backdropFilter = backdropFilter;
-            state.container.style.webkitBackdropFilter = backdropFilter;
+        st.svg.innerHTML = svgHTML;
+        const finalFilter = filters.join(' ');
+        if (finalFilter.trim()) {
+            st.container.style.backdropFilter = finalFilter;
+            st.container.style.webkitBackdropFilter = finalFilter;
         }
     }
 
@@ -196,9 +236,12 @@ export default class LiquidBackdrop {
         let m;
         while ((m = re.exec(str)) !== null) {
             const name = m[1];
-            const args = m[2] ? m[2].split(',').map(s => parseFloat(s.trim()) || s.trim()) : [];
-            if (this.filters.has(name)) tokens.push({ type: 'custom', name, args });
-            else tokens.push({ type: 'css', raw: m[0] });
+            if (this.filters.has(name) || name === 'shine') {
+                const args = m[2] ? m[2].split(',').map(s => parseFloat(s.trim()) || s.trim()) : [];
+                tokens.push({ type: 'custom', name, args });
+            } else {
+                tokens.push({ type: 'css', raw: m[0] });
+            }
         }
         return tokens;
     }
@@ -207,13 +250,13 @@ export default class LiquidBackdrop {
         this.filters.set('liquid-glass', (element, refraction = 1, bevel = 10, chromatic = 0) => {
             const width = Math.round(element.offsetWidth);
             const height = Math.round(element.offsetHeight);
-            if (width === 0 || height === 0) return '';
+            if (width < 1 || height < 1) return '';
 
-            const refractionValue = parseFloat(refraction) || 0;
-            const bevelValue = Math.max(1, parseFloat(bevel) || 0);
-            const chromaticValue = parseFloat(chromatic) || 0;
+            const refVal = parseFloat(refraction) || 0;
+            const bevVal = Math.max(1, parseFloat(bevel) || 0);
+            const chrVal = parseFloat(chromatic) || 0;
 
-            const maxDimension = Math.ceil(Math.max(width, height));
+            const maxDim = Math.ceil(Math.max(width, height));
 
             function drawRoundedPath(ctx, x, y, w, h, r) {
                 const radius = Math.min(r, Math.min(w / 2, h / 2));
@@ -229,139 +272,114 @@ export default class LiquidBackdrop {
                 ctx.quadraticCurveTo(x, y, x + radius, y);
                 ctx.closePath();
             }
-
-            function circleMap(x) {
-                if (x >= 1) return 1;
-                if (x <= 0) return 0;
-                return 1.0 - Math.sqrt(1.0 - x * x);
-            }
+            function circleMap(x) { return (x >= 1) ? 1 : (x <= 0) ? 0 : 1.0 - Math.sqrt(1.0 - x * x); }
 
             function createMap() {
                 const canvas = document.createElement('canvas');
-                canvas.width = maxDimension;
-                canvas.height = maxDimension;
+                canvas.width = maxDim; canvas.height = maxDim;
                 const ctx = canvas.getContext('2d');
-                
-                const imageData = ctx.createImageData(maxDimension, maxDimension);
-                const data = imageData.data;
+                const d = ctx.createImageData(maxDim, maxDim);
+                const data = d.data;
 
-                const startX = Math.floor((maxDimension - width) / 2);
-                const startY = Math.floor((maxDimension - height) / 2);
-                const endX = startX + width;
-                const endY = startY + height;
+                const sx = Math.floor((maxDim - width) / 2);
+                const sy = Math.floor((maxDim - height) / 2);
+                const ex = sx + width;
+                const ey = sy + height;
+                const limit = bevVal;
 
-                const limit = bevelValue;
+                const comp = getComputedStyle(element);
+                let br = parseFloat(comp.borderRadius) || 0;
+                if (comp.borderRadius.includes('%')) br = (parseFloat(comp.borderRadius)/100) * Math.min(width, height);
 
-                for (let y = 0; y < maxDimension; y++) {
-                    for (let x = 0; x < maxDimension; x++) {
-                        const idx = (y * maxDimension + x) * 4;
+                const cL = br, cR = width - br, cT = br, cB = height - br;
 
-                        if (x < startX || x >= endX || y < startY || y >= endY) {
-                            data[idx] = 127;     
-                            data[idx + 1] = 0;   
-                            data[idx + 2] = 127; 
-                            data[idx + 3] = 255;
-                            continue;
+                for (let y = 0; y < maxDim; y++) {
+                    for (let x = 0; x < maxDim; x++) {
+                        const idx = (y * maxDim + x) * 4;
+                        if (x < sx || x >= ex || y < sy || y >= ey) {
+                            data[idx]=127; data[idx+1]=0; data[idx+2]=127; data[idx+3]=255; continue;
                         }
 
-                        const lx = x - startX;
-                        const ly = y - startY;
+                        const lx = x - sx, ly = y - sy;
+                        let dist = 0, nx = 0, ny = 0;
+                        let inCorner = false, cx = 0, cy = 0;
 
-                        const dLeft = lx;
-                        const dRight = width - 1 - lx;
-                        const dTop = ly;
-                        const dBottom = height - 1 - ly;
-                        const minDist = Math.min(dLeft, dRight, dTop, dBottom);
+                        if (br > 0) {
+                            if (lx < cL && ly < cT) { inCorner=true; cx=cL; cy=cT; } 
+                            else if (lx > cR && ly < cT) { inCorner=true; cx=cR; cy=cT; } 
+                            else if (lx < cL && ly > cB) { inCorner=true; cx=cL; cy=cB; } 
+                            else if (lx > cR && ly > cB) { inCorner=true; cx=cR; cy=cB; } 
+                        }
 
-                        if (minDist < limit) {
-                            const progress = 1 - (minDist / limit); 
-                            const intensity = circleMap(progress);  
-
-                            let nx = 0, ny = 0;
-                            if (minDist === dLeft) nx = -1;
-                            else if (minDist === dRight) nx = 1;
-                            
-                            if (minDist === dTop) ny = -1;
-                            else if (minDist === dBottom) ny = 1;
-
-                            const dispX = 127 - (nx * intensity * 127);
-                            const dispY = 127 - (ny * intensity * 127);
-
-                            data[idx] = Math.max(0, Math.min(255, dispX));     // R
-                            data[idx + 2] = Math.max(0, Math.min(255, dispY)); // B
-                            data[idx + 1] = 0; // No highlight
-                            data[idx + 3] = 255;
+                        if (inCorner) {
+                            const dx = lx - cx, dy = ly - cy;
+                            const len = Math.sqrt(dx*dx + dy*dy);
+                            dist = br - len; 
+                            if (dist < limit && dist >= 0) { nx = dx/len; ny = dy/len; } else dist = 10000;
                         } else {
-                            data[idx] = 127;
-                            data[idx + 1] = 0;
-                            data[idx + 2] = 127;
-                            data[idx + 3] = 255;
+                            const dL = lx, dR = width - 1 - lx, dT = ly, dB = height - 1 - ly;
+                            dist = Math.min(dL, dR, dT, dB);
+                            if (dist < limit) {
+                                if (dist === dL) nx = -1; else if (dist === dR) nx = 1;
+                                else if (dist === dT) ny = -1; else if (dist === dB) ny = 1;
+                            }
+                        }
+
+                        if (dist < limit) {
+                            const prog = 1 - (dist / limit);
+                            const int = circleMap(prog);
+                            data[idx] = Math.max(0, Math.min(255, 127 - (nx * int * 127)));     
+                            data[idx+2] = Math.max(0, Math.min(255, 127 - (ny * int * 127))); 
+                            data[idx+3] = 255; 
+                        } else {
+                            data[idx]=127; data[idx+1]=0; data[idx+2]=127; data[idx+3]=255;
                         }
                     }
                 }
-                ctx.putImageData(imageData, 0, 0);
+                ctx.putImageData(d, 0, 0);
                 return canvas;
             }
 
-            function createFinalCanvas(sourceCanvas) {
-                const canvas = document.createElement('canvas');
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
+            function createFinalCanvas(source) {
+                const cvs = document.createElement('canvas');
+                cvs.width = width; cvs.height = height;
+                const ctx = cvs.getContext('2d');
+                ctx.fillStyle = "rgb(127, 0, 127)"; ctx.fillRect(0, 0, width, height);
+                const ox = (maxDim - width) / 2;
+                const oy = (maxDim - height) / 2;
+                ctx.drawImage(source, -Math.round(ox), -Math.round(oy));
 
-                ctx.fillStyle = "rgb(127, 0, 127)";
-                ctx.fillRect(0, 0, width, height);
+                const inset = bevVal;
+                const comp = getComputedStyle(element);
+                let br = parseFloat(comp.borderRadius) || 0;
+                if (comp.borderRadius.includes('%')) br = (parseFloat(comp.borderRadius)/100) * Math.min(width, height);
 
-                const offsetX = (maxDimension - width) / 2;
-                const offsetY = (maxDimension - height) / 2;
-                
-                ctx.drawImage(sourceCanvas, -Math.round(offsetX), -Math.round(offsetY));
-                
-                const computed = getComputedStyle(element);
-                let br = parseFloat(computed.borderRadius) || 0;
-                if (computed.borderRadius.includes('%')) br = (parseFloat(computed.borderRadius)/100) * Math.min(width, height);
-
-                const inset = bevelValue;
-                
                 if (width > inset * 2 && height > inset * 2) {
-                     ctx.fillStyle = "rgb(127, 0, 127)";
-                     if (bevelValue > 2) ctx.filter = `blur(${bevelValue/3}px)`;
-                     drawRoundedPath(ctx, inset, inset, width - (inset * 2), height - (inset * 2), Math.max(0, br - inset/2));
-                     ctx.fill();
+                    ctx.fillStyle = "rgb(127, 0, 127)";
+                    if (bevVal > 2) ctx.filter = `blur(${bevVal/3}px)`;
+                    drawRoundedPath(ctx, inset, inset, width - inset*2, height - inset*2, Math.max(0, br - inset/2));
+                    ctx.fill();
                 }
-
-                return canvas.toDataURL();
+                return cvs.toDataURL();
             }
 
-            const mapCanvas = createMap();
-            const mainDataURL = createFinalCanvas(mapCanvas);
+            const map = createMap();
+            const url = createFinalCanvas(map);
+            const scale = refVal * 2;
 
-            const baseScale = refractionValue * 2;
-
-            if (chromaticValue === 0) {
-                return `
-                    <feImage result="MAP" href="${mainDataURL}" color-interpolation-filters="sRGB"/>
-                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${baseScale}" xChannelSelector="R" yChannelSelector="B"/>
-                `;
+            if (chrVal === 0) {
+                return `<feImage result="MAP" href="${url}" color-interpolation-filters="sRGB"/>
+                        <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${scale}" xChannelSelector="R" yChannelSelector="B"/>`;
             } else {
-                 const rScale = baseScale + (chromaticValue * 2);
-                 const bScale = Math.max(0, baseScale - (chromaticValue * 2));
-                 
-                 return `
-                    <feImage result="MAP" href="${mainDataURL}" color-interpolation-filters="sRGB"/>
-                    
-                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${rScale}" xChannelSelector="R" yChannelSelector="B" result="R_DISP"/>
-                    <feComponentTransfer in="R_DISP" result="R_LAYER"><feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
-
-                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${baseScale}" xChannelSelector="R" yChannelSelector="B" result="G_DISP"/>
-                    <feComponentTransfer in="G_DISP" result="G_LAYER"><feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
-
-                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${bScale}" xChannelSelector="R" yChannelSelector="B" result="B_DISP"/>
-                    <feComponentTransfer in="B_DISP" result="B_LAYER"><feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/></feComponentTransfer>
-
-                    <feComposite in="R_LAYER" in2="G_LAYER" operator="arithmetic" k1="0" k2="1" k3="1" k4="0" result="RG"/>
-                    <feComposite in="RG" in2="B_LAYER" operator="arithmetic" k1="0" k2="1" k3="1" k4="0"/>
-                 `;
+                const rS = scale + (chrVal * 2), bS = Math.max(0, scale - (chrVal * 2));
+                return `<feImage result="MAP" href="${url}" color-interpolation-filters="sRGB"/>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${rS}" xChannelSelector="R" yChannelSelector="B" result="RD"/>
+                    <feComponentTransfer in="RD" result="RL"><feFuncR type="identity"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${scale}" xChannelSelector="R" yChannelSelector="B" result="GD"/>
+                    <feComponentTransfer in="GD" result="GL"><feFuncR type="discrete" tableValues="0"/><feFuncG type="identity"/><feFuncB type="discrete" tableValues="0"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feDisplacementMap in="SourceGraphic" in2="MAP" scale="${bS}" xChannelSelector="R" yChannelSelector="B" result="BD"/>
+                    <feComponentTransfer in="BD" result="BL"><feFuncR type="discrete" tableValues="0"/><feFuncG type="discrete" tableValues="0"/><feFuncB type="identity"/><feFuncA type="identity"/></feComponentTransfer>
+                    <feComposite in="RL" in2="GL" operator="arithmetic" k2="1" k3="1" result="RG"/><feComposite in="RG" in2="BL" operator="arithmetic" k2="1" k3="1"/>`;
             }
         });
     }
